@@ -2,6 +2,8 @@ import os
 import struct
 import glob
 import json
+import threading
+import time
 from collections import deque
 
 
@@ -47,42 +49,76 @@ class FifoDiskQueue(object):
         self.tailf = self._openchunk(self.info['tail'][0])
         os.lseek(self.tailf.fileno(), self.info['tail'][2], os.SEEK_SET)
 
+        self._head_lock = threading.RLock()
+        self._tail_lock = threading.RLock()
+        self._event = threading.Event()
+
     def push(self, string):
         hnum, hpos = self.info['head']
         hpos += 1
         szhdr = struct.pack(self.szhdr_format, len(string))
-        os.write(self.headf.fileno(), szhdr + string)
-        if hpos == self.chunksize:
-            hpos = 0
-            hnum += 1
-            self.headf.close()
-            self.headf = self._openchunk(hnum, 'ab+')
-        self.info['size'] += 1
-        self.info['head'] = [hnum, hpos]
+
+        with self._head_lock:
+            os.write(self.headf.fileno(), szhdr + string)
+            if hpos == self.chunksize:
+                hpos = 0
+                hnum += 1
+                self.headf.close()
+                self.headf = self._openchunk(hnum, 'ab+')
+
+            self.info['size'] += 1
+            self.info['head'] = [hnum, hpos]
+
+            self._event.set()
+            self._event.clear()
 
     def _openchunk(self, number, mode='r'):
         return open(os.path.join(self.path, 'q%05d' % number), mode)
 
-    def pop(self):
-        tnum, tcnt, toffset = self.info['tail']
-        if [tnum, tcnt] >= self.info['head']:
-            return
-        tfd = self.tailf.fileno()
-        szhdr = os.read(tfd, self.szhdr_size)
-        if not szhdr:
-            return
-        size, = struct.unpack(self.szhdr_format, szhdr)
-        data = os.read(tfd, size)
-        tcnt += 1
-        toffset += self.szhdr_size + size
-        if tcnt == self.chunksize and tnum <= self.info['head'][0]:
-            tcnt = toffset = 0
-            tnum += 1
-            self.tailf.close()
-            os.remove(self.tailf.name)
-            self.tailf = self._openchunk(tnum)
-        self.info['size'] -= 1
-        self.info['tail'] = [tnum, tcnt, toffset]
+    def pop(self, timeout=0):
+        start_time = time.time()
+        while True:
+            item = self._pop()
+            if item is not None:
+                return item
+
+            else:
+                if timeout is None:
+                    self._event.wait()
+
+                elif timeout != 0:
+                    wait_time = timeout - (time.time() - start_time)
+                    if wait_time > 0:
+                        if not self._event.wait(wait_time):
+                            return
+
+                else:
+                    return
+
+    def _pop(self):
+        with self._tail_lock:
+            tnum, tcnt, toffset = self.info['tail']
+            if [tnum, tcnt] >= self.info['head']:
+                return
+
+            tfd = self.tailf.fileno()
+            szhdr = os.read(tfd, self.szhdr_size)
+            size, = struct.unpack(self.szhdr_format, szhdr)
+            data = os.read(tfd, size)
+            tcnt += 1
+            toffset += self.szhdr_size + size
+
+            with self._head_lock:
+                if tcnt == self.chunksize and tnum <= self.info['head'][0]:
+                    tcnt = toffset = 0
+                    tnum += 1
+                    self.tailf.close()
+                    os.remove(self.tailf.name)
+                    self.tailf = self._openchunk(tnum)
+
+            self.info['size'] -= 1
+            self.info['tail'] = [tnum, tcnt, toffset]
+
         return data
 
     def close(self):
